@@ -12,6 +12,8 @@ import re
 import shutil
 import tempfile
 import threading
+import unicodedata
+import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +34,11 @@ def init_pool():
     POOL_LOCK.touch(exist_ok=True)
 
 
+def _sanitize_url(url: str) -> str:
+    """去除 URL 中可能混入的零宽字符及不可见控制字符（Unicode category Cf/Cc/Cs）。"""
+    return ''.join(c for c in url if unicodedata.category(c) not in ('Cf', 'Cc', 'Cs'))
+
+
 def normalize_url(url: str) -> str:
     """归一化 URL 为真实路径分级风格的 key（不做 URL 编码）。
     例：
@@ -48,7 +55,8 @@ def normalize_url(url: str) -> str:
     colon_idx = url.find(':')
     if colon_idx != -1 and (slash_idx == -1 or colon_idx < slash_idx):
         url = url[:colon_idx] + '/' + url[colon_idx + 1:]
-    # 4) 去掉末尾 .git
+    # 4) 去掉末尾 / 再去掉末尾 .git
+    url = url.rstrip('/')
     url = re.sub(r'\.git$', '', url)
     # 5) 折叠多余连续斜杠
     url = re.sub(r'/+', '/', url)
@@ -139,7 +147,7 @@ def parse_clone_args(args: List[str]) -> Tuple[List[str], List[str]]:
     options_with_value = {
         '-b', '--branch', '--depth', '--origin', '-o', '--template', '--reference',
         '--reference-if-able', '--separate-git-dir', '-c', '--config', '--server-option',
-        '--jobs', '-j', '--filter', '--shallow-since', '--shallow-exclude', '--recurse-submodules',
+        '--jobs', '-j', '--filter', '--shallow-since', '--shallow-exclude',
         '--upload-pack', '-u'
     }
     i = 0
@@ -257,18 +265,19 @@ def add_alternate(gitdir: str, pool_path: Path):
 def do_clone(global_opts: List[str], subcmd_args: List[str]):
     clone_args = subcmd_args
     if (has_option(clone_args, '--reference-if-able') or has_option(clone_args, '--shared') or
-            has_option(clone_args, '--bare') or has_option(clone_args, '--mirror')):
+            has_option(clone_args, '--bare') or has_option(clone_args, '--mirror') or
+            has_option(clone_args, '--dissociate')):
         return exec_git(global_opts + ['clone'] + subcmd_args)
 
     passthrough_args, positionals = parse_clone_args(clone_args)
     if not positionals:
         return exec_git(global_opts + ['clone'] + subcmd_args)
 
-    url = positionals[0]
+    url = _sanitize_url(positionals[0])
     if invalid_pool_url(url):
         return exec_git(global_opts + ['clone'] + subcmd_args)
 
-    dest = positionals[1] if len(positionals) > 1 else os.path.basename(url).replace('.git', '')
+    dest = positionals[1] if len(positionals) > 1 else os.path.basename(url.rstrip('/')).removesuffix('.git')
     pool_path = pool_repo_path(url)
     ensure_pool_repo(url, pool_path)
 
@@ -294,12 +303,38 @@ def do_clone(global_opts: List[str], subcmd_args: List[str]):
             register_shell(real_gitdir)
 
 
+def extract_gitdir_override(global_opts: List[str]) -> Optional[str]:
+    i = 0
+    while i < len(global_opts):
+        arg = global_opts[i]
+        if arg == '--git-dir' and i + 1 < len(global_opts):
+            return global_opts[i + 1]
+        if arg.startswith('--git-dir='):
+            return arg.split('=', 1)[1]
+        i += 1
+    return None
+
+
 def do_fetch(global_opts: List[str], subcmd_args: List[str]):
-    gitdir = find_gitdir(effective_cwd(global_opts))
+    gitdir_override = extract_gitdir_override(global_opts)
+    gitdir = gitdir_override if gitdir_override else find_gitdir(effective_cwd(global_opts))
     if not gitdir:
         return exec_git(global_opts + ['fetch'] + subcmd_args)
-    remote_url = run_git(global_opts + ['config', '--get', 'remote.origin.url'],
+    # --unshallow / --update-shallow 不触发池更新，直接透传
+    _DEPTH_FLAGS = {'--unshallow', '--update-shallow'}
+    if _DEPTH_FLAGS.intersection(subcmd_args):
+        return exec_git(global_opts + ['fetch'] + subcmd_args)
+    if '--dry-run' in subcmd_args:
+        return exec_git(global_opts + ['fetch'] + subcmd_args)
+    # 从 subcmd_args 中取用户指定的 remote 名（第一个非选项参数）
+    remote_name = 'origin'
+    for a in subcmd_args:
+        if not a.startswith('-'):
+            remote_name = a
+            break
+    remote_url = run_git(['--git-dir', gitdir, 'config', '--get', f'remote.{remote_name}.url'],
                          capture=True, check=False).stdout.strip()
+    remote_url = _sanitize_url(remote_url)
     if remote_url and not invalid_pool_url(remote_url):
         pool_path = pool_repo_path(remote_url)
         ensure_pool_repo(remote_url, pool_path)
@@ -383,7 +418,15 @@ def submodule_target_commit(parent_worktree: str, sub_path: str) -> Optional[str
 def get_remote_url(worktree: str) -> str:
     res = run_git(['-C', worktree, 'config', '--get', 'remote.origin.url'],
                   capture=True, check=False)
-    return res.stdout.strip()
+    return _sanitize_url(res.stdout.strip())
+
+
+def get_remote_url_by_name(gitdir: str, remote_name: str) -> str:
+    """返回指定 remote 名的 fetch URL（已 sanitize）；不存在或为本地路径时返回空串。"""
+    r = run_git(['--git-dir', gitdir, 'remote', 'get-url', remote_name], capture=True, check=False)
+    if r.returncode != 0:
+        return ''
+    return _sanitize_url(r.stdout.strip())
 
 
 def native_submodule_update_pool_first(parent_worktree: str, sub_path: str,
@@ -396,7 +439,7 @@ def native_submodule_update_pool_first(parent_worktree: str, sub_path: str,
         args.extend(['--depth', str(depth)])
     args.append('--')
     args.append(sub_path)
-    res = subprocess.run([SYSTEM_GIT] + args, capture=True, text=True, stdin=subprocess.DEVNULL)
+    res = subprocess.run([SYSTEM_GIT] + args, capture_output=True, text=True, stdin=subprocess.DEVNULL)
     if res.stdout:
         buf.append(res.stdout.rstrip('\n'))
     if res.stderr:
@@ -417,6 +460,7 @@ def process_one_submodule(parent_worktree: str, parent_remote: str, toplevel_git
 
     # 相对 URL 解析为绝对 URL
     url = resolve_relative_url(parent_remote, raw_url)
+    url = _sanitize_url(url)
 
     sub_worktree = os.path.join(parent_worktree, sub_path)
 
@@ -549,15 +593,28 @@ def process_submodule_level(parent_worktree: str, parent_remote: str,
                 print(line, file=sys.stderr)
 
 
-def parse_submodule_update_options(subcmd_args: List[str]) -> Tuple[bool, int, Optional[str], Optional[str]]:
-    """解析 git submodule update 的 --recursive / --jobs / --depth / --filter。"""
+def parse_submodule_update_options(subcmd_args: List[str]) -> Tuple[bool, int, Optional[str], Optional[str], List[str]]:
+    """解析 git submodule update 的 --recursive / --jobs / --depth / --filter，以及末尾 path 过滤。"""
     recursive = False
     jobs = 1
     depth: Optional[str] = None
     filter_: Optional[str] = None
+    paths: List[str] = []
     i = 0
+    past_separator = False
     while i < len(subcmd_args):
         a = subcmd_args[i]
+        if a == '--':
+            past_separator = True
+            i += 1
+            paths.extend(subcmd_args[i:])
+            break
+        if past_separator or (not a.startswith('-')):
+            # skip known subcommand "update" itself
+            if a not in ('update',):
+                paths.append(a)
+            i += 1
+            continue
         if a == '--recursive':
             recursive = True
         elif a in ('-j', '--jobs') and i + 1 < len(subcmd_args):
@@ -584,7 +641,7 @@ def parse_submodule_update_options(subcmd_args: List[str]) -> Tuple[bool, int, O
         i += 1
     if jobs < 1:
         jobs = 1
-    return recursive, jobs, depth, filter_
+    return recursive, jobs, depth, filter_, paths
 
 
 def do_submodule_update_init(global_opts: List[str], subcmd_args: List[str]):
@@ -597,13 +654,15 @@ def do_submodule_update_init(global_opts: List[str], subcmd_args: List[str]):
     4) update=none 纯 skip
     5) 相对 URL 先解析为绝对 URL 再走池流程
     """
-    recursive, jobs, depth, filter_ = parse_submodule_update_options(subcmd_args)
+    recursive, jobs, depth, filter_, paths = parse_submodule_update_options(subcmd_args)
 
     root = effective_cwd(global_opts)
     toplevel_gitdir = find_gitdir(root)
     parent_remote = get_remote_url(root)
 
     subs = parse_gitmodules(root)
+    if paths:
+        subs = [s for s in subs if s['path'] in paths or s['name'] in paths]
     if not subs:
         return
 
@@ -612,8 +671,10 @@ def do_submodule_update_init(global_opts: List[str], subcmd_args: List[str]):
 
 
 def do_submodule(global_opts: List[str], subcmd_args: List[str]):
-    """仅拦截 update --init；其他 submodule 子命令一律透传原生 git。"""
-    if subcmd_args and subcmd_args[0] == 'update' and '--init' in subcmd_args:
+    """仅拦截 update --init（且无 --remote）；其他 submodule 子命令一律透传原生 git。"""
+    if (subcmd_args and subcmd_args[0] == 'update'
+            and '--init' in subcmd_args
+            and '--remote' not in subcmd_args):
         do_submodule_update_init(global_opts, subcmd_args)
         return
     return exec_git(global_opts + ['submodule'] + subcmd_args)
@@ -710,10 +771,8 @@ def gc_pool_repos():
     for repo in repos:
         dependents = deps.get(str(repo), [])
         if not dependents:
-            print(f'[Wrapper] GC 池裸仓: {repo} (无已注册 worktree 依赖，prune=now)', file=sys.stderr)
-            result = run_git(['--git-dir', str(repo), 'gc', '--prune=now'], check=False)
-            if result.returncode != 0:
-                run_git(['--git-dir', str(repo), 'gc', '--prune=never'], check=True)
+            print(f'[Wrapper] GC 池裸仓: {repo} (无已注册 worktree 依赖，保守 prune=never)', file=sys.stderr)
+            run_git(['--git-dir', str(repo), 'gc', '--prune=never'], check=False)
             continue
         pool_objects = rev_list_objects(str(repo))
         if shell_live is None or pool_objects is None:
@@ -738,6 +797,188 @@ def do_gc(global_opts: List[str], subcmd: str, subcmd_args: List[str]):
     finally:
         release_lock(lock_fd)
     return exec_git(global_opts + [subcmd] + subcmd_args)
+
+
+# ---------- migrate ----------
+_MIGRATE_TMP_REF_RE = re.compile(r'^refs/migrate-([0-9a-f]{32})/')
+
+
+def _cleanup_migrate_tmp_refs(pool_path: Path):
+    """清理池裸仓里所有 refs/migrate-<uuid32>/（上次异常中断的残留）。
+
+    只删除 namespace 部分严格为 32 位小写十六进制（uuid4().hex）的 ref，
+    避免误删用户自建的其他 refs/migrate-* ref。
+    """
+    res = run_git(['--git-dir', str(pool_path), 'for-each-ref',
+                   '--format=%(refname)', 'refs/migrate-'],
+                  capture=True, check=False)
+    for refname in res.stdout.splitlines():
+        refname = refname.strip()
+        if refname and _MIGRATE_TMP_REF_RE.match(refname):
+            run_git(['--git-dir', str(pool_path), 'update-ref', '-d', refname],
+                    capture=True, check=False)
+
+
+def _fetch_local_to_pool(gitdir: str, pool_path: Path):
+    """将本地仓库所有对象 fetch 进池裸仓，完成后删除临时 ref。
+
+    使用 UUID 命名临时 ref 命名空间（refs/migrate-<uuid>/...），
+    避免与任何已有 ref 冲突。
+    """
+    uid = uuid.uuid4().hex
+    tmp_heads = f'refs/migrate-{uid}/heads/*'
+
+    # fetch 本地 heads 进池
+    run_git(['--git-dir', str(pool_path), 'fetch', gitdir,
+             f'+refs/heads/*:{tmp_heads}'],
+            capture=True, check=False)
+
+    # 立刻删除临时 ref（对象已在 pack 中，ref 无需保留）
+    res = run_git(['--git-dir', str(pool_path), 'for-each-ref',
+                   '--format=%(refname)', f'refs/migrate-{uid}/'],
+                  capture=True, check=False)
+    for refname in res.stdout.splitlines():
+        refname = refname.strip()
+        if refname:
+            run_git(['--git-dir', str(pool_path), 'update-ref', '-d', refname],
+                    capture=True, check=False)
+
+
+def _migrate_gitdir(gitdir: str, remote_url: str, label: str) -> bool:
+    """对一个已知 gitdir + remote_url 执行迁移核心逻辑（供父仓和 submodule 共用）。
+
+    label 用于日志前缀，例如 repo_path 或 "submodule <name>"。
+    返回 True 表示成功（含幂等跳过），False 表示失败。
+    """
+    pool_path = pool_repo_path(remote_url)
+    print(f'[Wrapper] migrate: {label}', file=sys.stderr)
+    print(f'[Wrapper]   remote : {remote_url}', file=sys.stderr)
+    print(f'[Wrapper]   pool   : {pool_path}', file=sys.stderr)
+
+    # 清理上次异常残留的临时 ref
+    _cleanup_migrate_tmp_refs(pool_path)
+
+    # 检查是否已有 alternates 指向该池路径（幂等）
+    existing = read_alternates(gitdir)
+    target_objects = os.path.abspath(str(pool_path / 'objects'))
+    already_linked = target_objects in existing
+    if already_linked:
+        print(f'[Wrapper]   已在池中，仅更新池裸仓', file=sys.stderr)
+
+    ensure_pool_repo(remote_url, pool_path)
+
+    # 将本地所有对象（含其他 remote fetch 来的）push 进池，最大化收缩本地
+    print(f'[Wrapper]   fetch 本地对象进池 ...', file=sys.stderr)
+    _fetch_local_to_pool(gitdir, pool_path)
+
+    if not already_linked:
+        add_alternate(gitdir, pool_path)
+    register_shell(gitdir)
+
+    print(f'[Wrapper]   repack --local ...', file=sys.stderr)
+    res = run_git(['--git-dir', gitdir, 'repack', '-a', '-d', '--local'], capture=True, check=False)
+    if res.returncode != 0:
+        print(f'[Wrapper]   repack 失败: {res.stderr.strip()}', file=sys.stderr)
+        return False
+
+    print(f'[Wrapper]   ✓ 迁移完成', file=sys.stderr)
+    return True
+
+
+def migrate_one(repo_path: str, recursive: bool = False, remote_name: str = 'origin') -> bool:
+    """将一个已有仓库迁移进对象池。
+
+    流程：
+    1. 按 remote_name 取 URL（默认 origin）；不存在则报错退出
+    2. 以该 URL 决定池路径，ensure_pool_repo
+    3. 将本地所有对象（含其他 remote 带来的）fetch 进池
+    4. 写 alternates + repack --local
+    5. 注册到 registry
+    若 recursive=True，递归处理所有 submodule（gitdir 位于 .git/modules/<name>）。
+
+    返回 True 表示成功，False 表示跳过或失败。
+    """
+    repo_path = os.path.abspath(repo_path)
+    gitdir = find_gitdir(repo_path)
+    if not gitdir:
+        print(f'[Wrapper] migrate: {repo_path} 不是 git 仓库，跳过', file=sys.stderr)
+        return False
+
+    primary_url = get_remote_url_by_name(gitdir, remote_name)
+    if not primary_url:
+        print(f'[Wrapper] migrate: remote "{remote_name}" 不存在或 URL 为空，请通过 --remote 指定正确的 remote 名', file=sys.stderr)
+        return False
+    if invalid_pool_url(primary_url):
+        print(f'[Wrapper] migrate: remote "{remote_name}" URL 为本地路径，跳过', file=sys.stderr)
+        return False
+
+    ok = _migrate_gitdir(gitdir, primary_url, repo_path)
+
+    if recursive:
+        # worktree_root：find_gitdir 可能返回 .git（普通仓库），worktree 就是其父目录
+        worktree = str(Path(gitdir).parent) if Path(gitdir).name == '.git' else repo_path
+
+        def _migrate_recursive(cur_worktree: str, parent_url: str, depth_label: str) -> bool:
+            sub_ok_all = True
+            cur_subs = parse_gitmodules(cur_worktree)
+            for s in cur_subs:
+                s_name = s['name']
+                s_url = resolve_relative_url(parent_url, s['url'])
+                if invalid_pool_url(s_url):
+                    print(f'[Wrapper] migrate: submodule {s_name} URL 为本地路径，跳过', file=sys.stderr)
+                    continue
+                s_worktree = os.path.join(cur_worktree, s['path'])
+                if not os.path.isdir(s_worktree):
+                    print(f'[Wrapper] migrate: submodule {s_name} worktree 不存在（未 init），跳过', file=sys.stderr)
+                    continue
+                s_gitdir = find_gitdir(s_worktree)
+                if not s_gitdir:
+                    print(f'[Wrapper] migrate: submodule {s_name} gitdir 不存在（未 init），跳过', file=sys.stderr)
+                    continue
+                label = f'submodule {s_name}' if not depth_label else f'{depth_label} / submodule {s_name}'
+                if not _migrate_gitdir(s_gitdir, s_url, label):
+                    sub_ok_all = False
+                # 嵌套继续
+                if not _migrate_recursive(s_worktree, s_url, label):
+                    sub_ok_all = False
+            return sub_ok_all
+
+        if not _migrate_recursive(worktree, primary_url, ''):
+            ok = False
+
+    return ok
+
+
+def do_migrate(args: List[str]):
+    """git migrate [--recursive|-r] [--remote <name>]
+
+    将当前仓库迁移进对象池（在仓库目录内执行，无需传路径）。
+    --recursive / -r：同时迁移所有已 init 的 submodule。
+    --remote <name>：指定用哪个 remote 的 URL 作为池的来源（默认 origin）。
+                     未指定且无 origin 时报错退出。
+    """
+    recursive = False
+    remote_name = 'origin'
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ('--recursive', '-r'):
+            recursive = True
+        elif a == '--remote':
+            i += 1
+            if i >= len(args):
+                print('[Wrapper] migrate: --remote 需要一个参数', file=sys.stderr)
+                sys.exit(1)
+            if args[i].startswith('-'):
+                print(f'[Wrapper] migrate: --remote 后接的 {args[i]!r} 看起来是选项而非 remote 名', file=sys.stderr)
+                sys.exit(1)
+            remote_name = args[i]
+        else:
+            print(f'[Wrapper] migrate: 未知参数 {a!r}', file=sys.stderr)
+            sys.exit(1)
+        i += 1
+
+    migrate_one(os.getcwd(), recursive=recursive, remote_name=remote_name)
 
 
 # ---------- main ----------
@@ -765,6 +1006,9 @@ def main():
         return
     if subcmd == 'prune':
         exec_git(global_opts + ['prune'] + subcmd_args)
+        return
+    if subcmd == 'migrate':
+        do_migrate(subcmd_args)
         return
 
     os.execvp(SYSTEM_GIT, [SYSTEM_GIT] + sys.argv[1:])

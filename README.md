@@ -72,6 +72,44 @@ ssh://git@host/storage/foo.git  -> ~/.git-pool/host/storage/foo
 
 ## 安装
 
+### 快速安装（一行命令）
+
+复制对应行在终端执行一次即可完成 clone + 配置 + 生效：
+
+**Bash**：
+
+```bash
+git clone git@github.com:mm304321141/git-object-pool.git ~/git-object-pool && printf '\n# git object pool wrapper\nfunction git() { python3 ~/git-object-pool/git-pool-wrapper.py "$@"; }\nsource ~/git-object-pool/git-pool-completion.bash\n' >> ~/.bash_profile && source ~/.bash_profile
+```
+
+**Zsh**：
+
+```zsh
+git clone git@github.com:mm304321141/git-object-pool.git ~/git-object-pool && printf '\n# git object pool wrapper\nfunction git() { python3 ~/git-object-pool/git-pool-wrapper.py "$@"; }\nsource ~/git-object-pool/git-pool-completion.zsh\n' >> ~/.zshrc && source ~/.zshrc
+```
+
+### 卸载
+
+**Bash**：
+
+```bash
+sed -i '' '/# git object pool wrapper/d; /git-pool-wrapper\.py/d; /git-pool-completion\.bash/d' ~/.bash_profile && source ~/.bash_profile
+```
+
+**Zsh**：
+
+```zsh
+sed -i '' '/# git object pool wrapper/d; /git-pool-wrapper\.py/d; /git-pool-completion\.zsh/d' ~/.zshrc && source ~/.zshrc
+```
+
+> 以上仅移除 profile 中的配置行，不删除 `~/git-object-pool` 目录。
+> 若要连目录一起删除：`rm -rf ~/git-object-pool`。
+> ⚠️ 删除目录前请确认本机没有仓库通过 `alternates` 依赖对象池（`~/.git-pool`），否则相关仓库会因缺失对象损坏。
+
+---
+
+### 方式一：可执行文件（推荐）
+
 将脚本放到任意固定路径，例如：
 
 ```bash
@@ -100,6 +138,57 @@ which git
 
 如你的系统 Git 不在该路径，需要修改脚本中的 `SYSTEM_GIT`。
 
+### 方式二：Shell Function
+
+不需要修改 `PATH`，直接在 shell profile 中定义一个名为 `git` 的函数覆盖系统命令：
+
+**Bash**（在 `~/.bash_profile` 或 `~/.bashrc` 中添加）：
+
+```bash
+# git object pool wrapper
+function git() {
+    python3 ~/Work/git-object-pool/git-pool-wrapper.py "$@"
+}
+```
+
+**Zsh**（在 `~/.zshrc` 中添加）：
+
+```zsh
+# git object pool wrapper
+function git() {
+    python3 ~/Work/git-object-pool/git-pool-wrapper.py "$@"
+}
+```
+
+添加后执行 `source ~/.bash_profile` 或 `source ~/.zshrc` 生效。
+
+### Shell 补全（可选）
+
+仓库提供了 bash 和 zsh 两套补全脚本，安装后可以在 `git migrate` 时通过 Tab 键补全选项和 remote 名。
+
+**Bash**（在 `~/.bash_profile` 或 `~/.bashrc` 中添加）：
+
+```bash
+source ~/Work/git-object-pool/git-pool-completion.bash
+```
+
+**Zsh**（在 `~/.zshrc` 中添加）：
+
+```zsh
+source ~/Work/git-object-pool/git-pool-completion.zsh
+```
+
+添加后重新打开终端或执行 `source ~/.bash_profile` / `source ~/.zshrc` 即可生效。
+
+> **注意（Shell Function 安装方式）**：如果使用方式二（shell function），bash 有时不会自动将补全函数绑定到同名 function，需要在补全脚本 source 之后手动绑定：
+> 
+> ```bash
+> source ~/Work/git-object-pool/git-pool-completion.bash
+> complete -F _git git
+> ```
+> 
+> Zsh 通常不需要额外绑定。
+
 ## 使用方式
 
 安装后继续按普通 Git 命令使用即可。
@@ -127,6 +216,39 @@ git submodule update --init --recursive --jobs 8
 ```
 
 wrapper 会解析 `.gitmodules`，为每个 submodule 预热对象池，并让 submodule gitdir 通过 alternates 引用池对象。
+
+### Migrate
+
+将一个已存在的普通仓库迁移为对象池化仓库，把历史对象从本地 `.git` 移到共享池（默认 `~/.git-pool`）：
+
+```bash
+# 在仓库目录内执行（无需传路径），使用 remote.origin.url 作为池来源
+git migrate
+
+# 指定 remote 名（仓库没有 origin 或想用其他 remote 时）
+git migrate --remote gitlab
+
+# 同时迁移所有已 init 的 submodule
+git migrate -r
+git migrate --recursive
+
+# 指定 remote + 递归
+git migrate -r --remote gitlab
+```
+
+迁移流程概览：
+
+1. 根据指定 remote（默认 `origin`）的 URL 在对象池中创建或更新对应 bare repository。
+2. 将本仓库本地所有对象（含通过其他 remote fetch 来的）fetch 进池，最大化后续压缩空间。
+3. 通过 alternates 让本仓库引用池对象，再执行 `git repack --local` 收缩本地存储。
+4. `--recursive` 时会对已 init 的 submodule（含嵌套 submodule）重复以上步骤。
+
+注意事项：
+
+- 迁移后仓库依赖 `~/.git-pool`（或 `GIT_POOL` 指向的路径），删除或损坏对象池会让仓库无法读取历史对象。
+- 仓库无 `origin` 且未指定 `--remote` 时，命令会报错退出，需显式指定 remote 名。
+- 仅对已经存在的本地仓库生效；对未 clone 的仓库请使用 `git clone`，wrapper 会在 clone 阶段自动池化。
+- 迁移操作会修改本仓库的 `objects/info/alternates`，建议在工作区干净时执行。
 
 ### GC
 
@@ -200,3 +322,5 @@ export GIT_POOL=/data/git-pool
 ## 文件
 
 - `git-pool-wrapper.py`：主脚本，作为 `git` wrapper 使用。
+- `git-pool-completion.bash`：Bash 补全脚本，source 到 `~/.bash_profile` 后生效。
+- `git-pool-completion.zsh`：Zsh 补全脚本，source 到 `~/.zshrc` 后生效。
