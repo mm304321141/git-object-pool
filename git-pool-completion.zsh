@@ -7,8 +7,7 @@
 #
 # This registers a _git-migrate completion function and hooks it into zsh's
 # git completion so that:
-#   git migrate <Tab>          -> --recursive  -r  --remote
-#   git migrate --remote <Tab> -> remote names in the current repo
+#   git migrate <Tab>          -> --recursive  -r
 
 # Ensure compinit has been called.
 autoload -Uz compinit
@@ -19,21 +18,9 @@ fi
 # Hook into zsh git completion: define _git-migrate so that the built-in
 # _git dispatcher finds it automatically when the subcommand is "migrate".
 _git-migrate () {
-    local curcontext="$curcontext" state state_descr line
-    typeset -A opt_args
-
     _arguments -C \
         '(-r --recursive)'{-r,--recursive}'[also migrate initialized submodules]' \
-        '--remote=[remote name to use as pool source]:remote:->remotes' \
         && return 0
-
-    case $state in
-        remotes)
-            local -a remotes
-            remotes=( ${(f)"$(git remote 2>/dev/null)"} )
-            _describe 'remote' remotes
-            ;;
-    esac
 }
 
 # Register "migrate" as a known git subcommand for zsh's _git dispatcher.

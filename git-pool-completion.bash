@@ -8,8 +8,7 @@
 # This file sources Apple Git's built-in git-completion.bash (if not already
 # loaded) and wraps Git's main completion dispatcher so that:
 #   git <Tab>                  -> all normal git subcommands + migrate
-#   git migrate <Tab>          -> --recursive  -r  --remote
-#   git migrate --remote <Tab> -> remote names in the current repo
+#   git migrate <Tab>          -> --recursive  -r
 
 # Source Apple Git's completion if Git completion is not yet defined.
 _git_pool_completion_bash=/Library/Developer/CommandLineTools/usr/share/git-core/git-completion.bash
@@ -23,27 +22,16 @@ unset _git_pool_completion_bash
 
 _git_migrate ()
 {
-    local cur prev
+    local cur
     cur="${COMP_WORDS[COMP_CWORD]}"
-    prev="${COMP_WORDS[COMP_CWORD-1]}"
-
-    case "$prev" in
-        --remote)
-            # Complete with remote names
-            local remotes
-            remotes=$(git remote 2>/dev/null)
-            COMPREPLY=( $(compgen -W "$remotes" -- "$cur") )
-            return
-            ;;
-    esac
 
     case "$cur" in
         --*)
-            COMPREPLY=( $(compgen -W "--recursive --remote" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--recursive" -- "$cur") )
             return
             ;;
         -*)
-            COMPREPLY=( $(compgen -W "-r --recursive --remote" -- "$cur") )
+            COMPREPLY=( $(compgen -W "-r --recursive" -- "$cur") )
             return
             ;;
         *)
