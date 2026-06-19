@@ -5,7 +5,7 @@
 >
 > **Windows 原生环境**（CMD / PowerShell）目前**未经作者实际测试**，如遇 Bug 欢迎反馈。
 
-一个用于复用 Git 对象存储的 Python wrapper。它通过拦截常见 Git 操作，在本机维护一个全局唯一的裸仓对象池（`~/.git-pool/pool.git`），让多个 worktree、clone 结果和 submodule 共享同一批 Git objects，降低重复下载与磁盘占用。
+Git Object Pool Wrapper 是一个 Git 增强工具，以对用户透明为首要设计目标：它在底层完全依赖原生 Git 实现，不引入任何私有存储格式或协议，所有原生 Git 命令保持原有语义不变，在 Git 之上仅扩展了一条子命令 `git migrate`。具体而言，本工具通过拦截常见 Git 操作，在本机维护一个全局唯一的裸仓对象池（`~/.git-pool/pool.git`），并结合 Git alternates 与 `--reference` 机制，让多个 worktree、clone 结果和 submodule 共享同一批 Git objects，从而降低重复下载与磁盘占用。
 
 ## 背景
 
@@ -16,7 +16,7 @@
 - 克隆了同一项目的不同 fork 仓库，这些仓库来自不同团队或个人，对象大量重叠却各自独立存放。
 - 从不同源克隆了同一项目的仓库，虽然 remote URL 不同但内容高度重叠，仍会耗费大量磁盘空间与下载时间。
 
-`git-pool-wrapper.py` 或许可以解决你的困扰：它通过维护全局唯一对象池，并结合 Git alternates 与 `--reference` 机制，让多个工作区复用同一批对象，从而降低重复下载与磁盘占用。
+如果你正在经历上述问题，本工具或许可以解决你的困扰。
 
 ## 核心能力
 
@@ -82,7 +82,7 @@ wrapper 维护一个全局唯一的对象池：
 
 ### 快速安装（一行命令）
 
-复制对应行在终端执行一次即可完成 clone + 配置 + 生效：
+以下命令将自动完成 clone、配置和补全脚本的安装，适合快速上手。若需手动控制安装路径或安装方式，参见下方方式一/方式二。
 
 **Bash**：
 
@@ -107,38 +107,6 @@ mkdir "%USERPROFILE%\git-object-pool" 2>nul & curl -L -o "%USERPROFILE%\git-obje
 ```powershell
 $dir="$env:USERPROFILE\git-object-pool"; New-Item -ItemType Directory -Force $dir | Out-Null; iwr -UseBasicParsing "https://raw.githubusercontent.com/mm304321141/git-object-pool/main/git-pool-wrapper.py" -OutFile "$dir\git-pool-wrapper.py"; iwr -UseBasicParsing "https://raw.githubusercontent.com/mm304321141/git-object-pool/main/git-pool-completion.ps1" -OutFile "$dir\git-pool-completion.ps1"; Set-Content -Encoding ASCII "$dir\git.ps1" "& python `"$dir\git-pool-wrapper.py`" @args; exit `$LASTEXITCODE"; $realGit = (Get-Command git -All -ErrorAction SilentlyContinue | Where-Object { $_.Source -notlike "*git-object-pool*" } | Select-Object -First 1).Source; if ($realGit) { [Environment]::SetEnvironmentVariable('SYSTEM_GIT', $realGit, 'User'); Write-Host "SYSTEM_GIT set to $realGit" } else { Write-Host "Could not detect git.exe automatically. Please run: [Environment]::SetEnvironmentVariable('SYSTEM_GIT','C:\Program Files\Git\bin\git.exe','User')" }; if (-not (Test-Path $PROFILE)) { New-Item -Path $PROFILE -ItemType File -Force | Out-Null }; $completionLine = ". `"$dir\git-pool-completion.ps1`""; if (-not (Select-String -Path $PROFILE -Pattern ([regex]::Escape($completionLine)) -Quiet)) { Add-Content -Path $PROFILE -Value "`n$completionLine" }; Write-Host "Completion added to `$PROFILE. Run: . `$PROFILE to activate."; Write-Host "Add $dir to the front of PATH."
 ```
-
-### 卸载
-
-**Bash**：
-
-```bash
-sed -i '' '/# git object pool wrapper/d; /git-pool-wrapper\.py/d; /git-pool-completion\.bash/d' ~/.bash_profile && source ~/.bash_profile
-```
-
-**Zsh**：
-
-```zsh
-sed -i '' '/# git object pool wrapper/d; /git-pool-wrapper\.py/d; /git-pool-completion\.zsh/d' ~/.zshrc && source ~/.zshrc
-```
-
-**Windows CMD**：
-
-```bat
-del "%USERPROFILE%\git-object-pool\git.cmd" & del "%USERPROFILE%\git-object-pool\git-pool-wrapper.py" & echo Done. Remember to remove "%USERPROFILE%\git-object-pool" from PATH and unset SYSTEM_GIT if set.
-```
-
-**Windows PowerShell**：
-
-```powershell
-Remove-Item "$env:USERPROFILE\git-object-pool\git.ps1","$env:USERPROFILE\git-object-pool\git-pool-wrapper.py" -ErrorAction SilentlyContinue; Write-Host "Done. Remember to remove $env:USERPROFILE\git-object-pool from PATH and unset SYSTEM_GIT if set."
-```
-
-> 以上仅移除 profile 中的配置行，不删除 `~/git-object-pool` 目录。
-> 若要连目录一起删除：`rm -rf ~/git-object-pool`。
-> ⚠️ 删除目录前请确认本机没有仓库通过 `alternates` 依赖对象池（`~/.git-pool`），否则相关仓库会因缺失对象损坏。
-
----
 
 ### 方式一：可执行文件（推荐）
 
@@ -199,7 +167,7 @@ which git
 ```bash
 # git object pool wrapper
 function git() {
-    python3 ~/Work/git-object-pool/git-pool-wrapper.py "$@"
+    python3 ~/git-object-pool/git-pool-wrapper.py "$@"
 }
 ```
 
@@ -208,7 +176,7 @@ function git() {
 ```zsh
 # git object pool wrapper
 function git() {
-    python3 ~/Work/git-object-pool/git-pool-wrapper.py "$@"
+    python3 ~/git-object-pool/git-pool-wrapper.py "$@"
 }
 ```
 
@@ -231,13 +199,13 @@ function git { & python "$env:USERPROFILE\git-object-pool\git-pool-wrapper.py" @
 **Bash**（在 `~/.bash_profile` 或 `~/.bashrc` 中添加）：
 
 ```bash
-source ~/Work/git-object-pool/git-pool-completion.bash
+source ~/git-object-pool/git-pool-completion.bash
 ```
 
 **Zsh**（在 `~/.zshrc` 中添加）：
 
 ```zsh
-source ~/Work/git-object-pool/git-pool-completion.zsh
+source ~/git-object-pool/git-pool-completion.zsh
 ```
 
 添加后重新打开终端或执行 `source ~/.bash_profile` / `source ~/.zshrc` 即可生效。
@@ -245,7 +213,7 @@ source ~/Work/git-object-pool/git-pool-completion.zsh
 > **注意（Shell Function 安装方式）**：如果使用方式二（shell function），bash 有时不会自动将补全函数绑定到同名 function，需要在补全脚本 source 之后手动绑定：
 > 
 > ```bash
-> source ~/Work/git-object-pool/git-pool-completion.bash
+> source ~/git-object-pool/git-pool-completion.bash
 > complete -F _git git
 > ```
 > 
@@ -268,6 +236,36 @@ copy git-pool-completion.lua "%LocalAppData%\clink\"
 ```
 
 添加后执行 `. $PROFILE` 生效。
+
+## 卸载
+
+**Bash**：
+
+```bash
+sed -i '' '/# git object pool wrapper/d; /git-pool-wrapper\.py/d; /git-pool-completion\.bash/d' ~/.bash_profile && source ~/.bash_profile
+```
+
+**Zsh**：
+
+```zsh
+sed -i '' '/# git object pool wrapper/d; /git-pool-wrapper\.py/d; /git-pool-completion\.zsh/d' ~/.zshrc && source ~/.zshrc
+```
+
+**Windows CMD**：
+
+```bat
+del "%USERPROFILE%\git-object-pool\git.cmd" & del "%USERPROFILE%\git-object-pool\git-pool-wrapper.py" & echo Done. Remember to remove "%USERPROFILE%\git-object-pool" from PATH and unset SYSTEM_GIT if set.
+```
+
+**Windows PowerShell**：
+
+```powershell
+Remove-Item "$env:USERPROFILE\git-object-pool\git.ps1","$env:USERPROFILE\git-object-pool\git-pool-wrapper.py" -ErrorAction SilentlyContinue; Write-Host "Done. Remember to remove $env:USERPROFILE\git-object-pool from PATH and unset SYSTEM_GIT if set."
+```
+
+> 以上仅移除 profile 中的配置行，不删除 `~/git-object-pool` 目录。
+> 若要连目录一起删除：`rm -rf ~/git-object-pool`。
+> ⚠️ 删除目录前请确认本机没有仓库通过 `alternates` 依赖对象池（`~/.git-pool`），否则相关仓库会因缺失对象损坏。
 
 ## 使用方式
 
@@ -366,7 +364,7 @@ wrapper 会先执行对象池维护，再透传执行原生 `git gc`。
 
 ## 注意事项
 
-- wrapper 依赖 Unix 文件锁，适用于 macOS / Linux 等类 Unix 环境。
+- 文件锁：macOS / Linux 使用 `fcntl` 排他锁；Windows 使用 `msvcrt` 文件锁。
 - wrapper 使用 Git alternates 共享对象；不要手动删除对象池中仍被工作区引用的 bare repository。
 - 如果对象池损坏，脚本会立即将损坏的池归档备份（重命名为 `.bak` 目录），然后重新初始化。
 - `git gc` 的对象池维护依赖 `.registered_shells`，如果工作区被手动移动或删除，registry 会在清理时过滤失效路径。
