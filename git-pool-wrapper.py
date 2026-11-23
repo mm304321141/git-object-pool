@@ -537,8 +537,11 @@ def _fetch_pool_remote(name: str, url: str) -> None:
     # 进程内去重：同一 URL 在本次进程内只 fetch 一次，避免递归 submodule 重复拉取
     if url in _fetched_urls:
         return
+    # 池内对象可能仅被借用仓库引用，fetch 的原生自动维护不能替代受控池 GC。
+    # 仅对内部调用禁用维护，不修改池或工作仓库的持久配置。
     # check=False: 池更新失败不应中断主命令（worktree 仍可用旧对象 + 后续直连）
-    run_git(['--git-dir', str(POOL_PATH), 'fetch', name, '--prune', '--progress'],
+    run_git(['-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
+             '--git-dir', str(POOL_PATH), 'fetch', name, '--prune', '--progress'],
             capture=False, check=False)
     _fetched_urls.add(url)
 
@@ -1382,11 +1385,10 @@ def add_gc_protect_refs(pool_repo: Path, commits: set) -> int:
                          capture=True, check=False)
         if exists.returncode != 0:
             continue
-        # check=False: 个别 ref 创建失败不应中断整体保护，按成功计数即可
-        res = run_git(['--git-dir', str(pool_repo), 'update-ref', _OBJECT_POOL_NS + sha, sha],
-                      capture=True, check=False)
-        if res.returncode == 0:
-            created += 1
+        # 保护 ref 创建失败必须中止 GC，不能带着残缺保护集合继续 prune。
+        run_git(['--git-dir', str(pool_repo), 'update-ref', _OBJECT_POOL_NS + sha, sha],
+                capture=True)
+        created += 1
     return created
 
 
@@ -1407,103 +1409,81 @@ def cleanup_object_pool_refs(pool_repo: Path):
 
 
 def gc_pool_repos(extra_args: Optional[List[str]] = None):
-    """全局唯一对象池 GC。
+    """持锁维护唯一对象池；成功后清除旧 gc.log，并记录成功时间。
 
-    extra_args 是用户通过 `git gc <flags>` 传入、被白名单允许的参数子集，
-    会按需要转发给内部的 repack/prune（见 do_gc 中的白名单）。
+    对象保护覆盖整个 repack/prune 阶段。任何分析、保护或维护失败都中止，
+    保留 gc.log 和上次成功时间，避免伪装成已恢复或阻挡用户立即重试。
     """
     extra_args = extra_args or []
     if not POOL_PATH.exists():
         return
     pass_quiet = '--quiet' in extra_args
     pass_aggressive = '--aggressive' in extra_args
-    # --prune=never：用户显式要求不 prune，则池 GC 也跳过 prune（仅 repack 整理）
     prune_never = '--prune=never' in extra_args
-    # 频率限制——距上次全池 GC 不足 GC_MIN_INTERVAL 则跳过本次。
     now = time.time()
+    gc_log = POOL_PATH / 'gc.log'
     try:
         last_run = float(GC_LAST_RUN_FILE.read_text().strip())
     except (OSError, ValueError):
         last_run = 0.0
-    if now - last_run < GC_MIN_INTERVAL:
+    # 显式 git gc 必须能恢复旧日志，不能被日常维护的一小时限频挡住。
+    if now - last_run < GC_MIN_INTERVAL and not gc_log.exists():
         print(f'[Wrapper] 距上次全池 GC 不足 {GC_MIN_INTERVAL}s '
               f'（{int(now - last_run)}s 前），跳过本次全池 GC', file=sys.stderr)
         return
-    # 提前写入时间戳：即便本次 GC 中途异常，也不会让短时间内的重复调用反复触发全池 GC。
-    try:
-        GC_LAST_RUN_FILE.write_text(str(now))
-    except OSError as e:
-        print(
-            f'[Wrapper] warning: 写入 {GC_LAST_RUN_FILE} 失败: {e}',
-            file=sys.stderr)
 
     shells = registered_shells()
     dependents = pool_dependents(shells)
-    # shells_enumerable：所有依赖 worktree 能否完整枚举可达对象。仅作「能否完整枚举」的
-    # 保守判据：任一 worktree 枚举失败（False）则对应池仓走 prune=never，避免误删。
-    # （不再构造跨 worktree 的巨型对象集合，省内存。）
-    shells_enumerable = all_shells_enumerable(shells)
-    # shell_live_commits：worktree rev-list --all 的全部 commit（含 refs/tags 可达）。
-    # 真正驱动 prune 保护——连同各 worktree 的 branch tip 一起在池内建临时保护 ref。
-    shell_live_commits = collect_shell_live_commits(shells)
     repo = POOL_PATH
     gc_quiet_args = ['--quiet'] if pass_quiet else []
     if not dependents:
-        print(
-            f'[Wrapper] GC 池裸仓: {repo} (无 worktree 依赖，保守 prune=never)',
-            file=sys.stderr)
-        # check=False: 无依赖时仅整理、不阻断
-        run_git(['--git-dir', str(repo), 'gc', '--prune=never'] +
-                gc_quiet_args, check=False)
-        return
-    pool_object_count = count_pool_objects(str(repo))
-    if not shells_enumerable or pool_object_count is None or shell_live_commits is None:
-        print(
-            f'[Wrapper] GC 池裸仓: {repo} (依赖分析失败，prune=never)',
-            file=sys.stderr)
-        res = run_git(['--git-dir', str(repo), 'gc', '--prune=never'] + gc_quiet_args,
-                      capture=True, check=False)
-        if res.returncode != 0:
-            print(f'[Wrapper] warning: gc --prune=never 失败 for {repo}: '
-                  f'{(res.stderr or "").strip()}', file=sys.stderr)
-        return
-    print(f'[Wrapper] GC 池裸仓: {repo} (被 {len(dependents)} 个 worktree 依赖，'
-          f'pool_objects={pool_object_count})', file=sys.stderr)
-    # prune/repack 前，把所有依赖 worktree 的 branch tip + HEAD 在池内用临时 ref
-    # 保护起来：即使 local-only commit 在池端没有任何 ref 指向（_fetch_local_to_pool
-    # fetch 后已删临时 ref），也不会被 prune 误删。再并入 shell_live_commits
-    # （worktree rev-list --all 的全部 commit），使 prune 决策与 shell 实际所需挂钩。
-    protect_commits = set()
-    for dep in dependents:
-        protect_commits.update(collect_repo_ref_tips(dep, include_annotated_tags=True))
-    protect_commits.update(shell_live_commits)
-    # 先清理上次异常残留的保护 ref，再创建本次保护 ref。
-    cleanup_object_pool_refs(repo)
-    protected = add_gc_protect_refs(repo, protect_commits)
-    print(
-        f'[Wrapper]   gc-protect: 保护 {protected}/{len(protect_commits)} 个 commit',
-        file=sys.stderr)
-    try:
-        if not prune_never:
-            prune_args = ['--git-dir', str(repo), 'prune', '--expire=now']
-            if pass_quiet:
-                prune_args.append('--quiet')
-            res = run_git(prune_args, capture=True, check=False)
-            if res.returncode != 0:
-                print(f'[Wrapper] warning: pool prune 失败 for {repo}: '
-                      f'{(res.stderr or "").strip()}', file=sys.stderr)
-        repack_args = ['--git-dir', str(repo), 'repack', '-Ad']
-        if pass_quiet:
-            repack_args.append('-q')
-        if pass_aggressive:
-            repack_args.append('-f')  # repack 的 aggressive 等价：强制重新计算 delta
-        res = run_git(repack_args, capture=True, check=False)
-        if res.returncode != 0:
-            print(f'[Wrapper] warning: pool repack 失败 for {repo}: '
-                  f'{(res.stderr or "").strip()}', file=sys.stderr)
-    finally:
-        # 无论 prune/repack 成功与否，都清除临时保护 ref，避免污染池裸仓。
+        print(f'[Wrapper] GC 池裸仓: {repo} (无 worktree 依赖，保守 prune=never)',
+              file=sys.stderr)
+        # 不知道借用者时保留全部不可达对象，仅整理存储。
+        run_git(['--git-dir', str(repo), 'gc', '--prune=never'] + gc_quiet_args,
+                capture=True)
+    else:
+        shells_enumerable = all_shells_enumerable(shells)
+        pool_object_count = count_pool_objects(str(repo))
+        shell_live_commits = collect_shell_live_commits(shells)
+        if (not shells_enumerable or pool_object_count is None or
+                shell_live_commits is None):
+            raise GitCommandError('池 GC 依赖分析失败，未清理对象或 gc.log')
+        print(f'[Wrapper] GC 池裸仓: {repo} (被 {len(dependents)} 个 worktree 依赖，'
+              f'pool_objects={pool_object_count})', file=sys.stderr)
+        protect_commits = set(shell_live_commits)
+        for dep in dependents:
+            protect_commits.update(collect_repo_ref_tips(dep, include_annotated_tags=True))
         cleanup_object_pool_refs(repo)
+        try:
+            protected = add_gc_protect_refs(repo, protect_commits)
+            print(f'[Wrapper]   gc-protect: 保护 {protected}/{len(protect_commits)} 个对象',
+                  file=sys.stderr)
+            # -A 先把旧 pack 中不可达对象释放为 loose，再 prune，一次完成回收。
+            # 临时保护 ref 必须一直保留到 prune 成功结束。
+            repack_args = ['--git-dir', str(repo), 'repack', '-Ad']
+            if pass_quiet:
+                repack_args.append('-q')
+            if pass_aggressive:
+                repack_args.append('-f')
+            run_git(repack_args, capture=True)
+            if not prune_never:
+                prune_args = ['--git-dir', str(repo), 'prune', '--expire=now']
+                run_git(prune_args, capture=True)
+        finally:
+            cleanup_object_pool_refs(repo)
+
+    # 只有受控维护完整成功才解除旧日志阻挡；失败时让 main 返回非零。
+    try:
+        gc_log.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise GitCommandError(f'池维护完成，但清除 {gc_log} 失败: {e}') from e
+    try:
+        GC_LAST_RUN_FILE.write_text(str(now))
+    except OSError as e:
+        print(f'[Wrapper] warning: 写入 {GC_LAST_RUN_FILE} 失败: {e}', file=sys.stderr)
 
 
 def do_gc_command(global_opts: List[str], subcmd_args: List[str]):
@@ -1540,7 +1520,8 @@ def _fetch_local_to_pool(gitdir: str, pool_path: Path) -> bool:
         try:
             # 1) fetch 对象进池：显式写入 refs/object-pool/ 临时命名空间
             # check=False: 迁移属尽力而为，单次 fetch 失败交由调用方据后续 repack 结果判断
-            fetch_res = run_git(['--git-dir', str(pool_path), 'fetch',
+            fetch_res = run_git(['-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
+                                 '--git-dir', str(pool_path), 'fetch',
                                  gitdir,
                                  'refs/heads/*:refs/object-pool/heads/*',
                                  'refs/tags/*:refs/object-pool/tags/*',
